@@ -52,6 +52,23 @@ was ported from.
 - Possible follow-up, not included: per-repository `.d365fo/settings.json` found from the
   working directory.
 
+### Fixed — `modify add-index` on table extensions, and non-unique indexes coming out unique
+
+- **An index on a table extension may name the base table's fields.** `add-index` checked the
+  index fields against the `<Fields>` of the document it was editing, which for an
+  `AxTableExtension` holds only the fields that extension adds. An extension that adds one
+  field therefore refused every base-table field (`VendInvoiceInfoTable.Num` came back
+  `FIELD_NOT_FOUND` although `get table` lists it), and one that adds none skipped the check
+  altogether. The known fields are now the base table's (from the index), the extension's own
+  and those of the table's other extensions; when the base table is not in the index the check
+  is skipped as before.
+- **`add-index --allow-duplicates` writes `AllowDuplicates=Yes`.** It wrote nothing, on the
+  assumption that the serializer's default is Yes. It is No — the standard application omits
+  the element on its unique indexes and spells out Yes on the others, and the extractor already
+  reads it that way — so the index was created UNIQUE while the response said `unique:false`.
+- **`generate table --index Name:Fields` (no `unique` flag) writes `AllowDuplicates=Yes`** for
+  the same reason. A `valid-time-state` key stays unique, which it had only been by accident.
+
 ### Fixed — `d365fo build` builds X++ projects without MSB4062 (#211)
 
 - **No command-line MSBuild can build an `.rnrproj`**, Visual Studio's included. Measured on a
