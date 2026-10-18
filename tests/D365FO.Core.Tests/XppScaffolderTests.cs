@@ -183,8 +183,15 @@ public class XppScaffolderExtensionTests
         var dateIdx = indexes.Single(i => i.Element("Name")!.Value == "DateIdx");
         Assert.Equal("Yes", dateIdx.Element("ValidTimeStateKey")!.Value);
         Assert.Equal("Gap", dateIdx.Element("ValidTimeStateMode")!.Value);
+        Assert.Equal("No", dateIdx.Element("AllowDuplicates")!.Value);
         var priceIdx = indexes.Single(i => i.Element("Name")!.Value == "PriceIdx");
         Assert.Equal("No", priceIdx.Element("AllowDuplicates")!.Value);
+        // An absent AllowDuplicates reads back as No, so a non-unique index must say Yes.
+        var nonUnique = XppScaffolder.Table("T3",
+            fields: new[] { new TableFieldSpec("A", "Name", null, false) },
+            indexes: new[] { new D365FO.Core.Scaffolding.TableIndexSpec("AIdx", ["A"]) });
+        Assert.Equal("Yes", nonUnique.Root!.Element("Indexes")!.Elements("AxTableIndex")
+            .Single(i => i.Element("Name")!.Value == "AIdx").Element("AllowDuplicates")!.Value);
         // NoGap is the SDK default the serializer omits — never written explicitly.
         var noGap = XppScaffolder.Table("T2",
             fields: new[] { new TableFieldSpec("A", "Name", null, false) },

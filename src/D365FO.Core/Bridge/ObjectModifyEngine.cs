@@ -845,7 +845,7 @@ public static class ObjectModifyEngine
             Operation.AddField => AddField(doc, request, repo),
             Operation.AddEnumValue => AddEnumValue(doc, request),
             Operation.AddControl => AddControl(doc, request),
-            Operation.AddIndex => AddIndex(doc, request),
+            Operation.AddIndex => AddIndex(doc, request, target, repo),
             Operation.AddRelation => AddRelation(doc, request),
             Operation.AddFieldGroup => AddFieldGroup(doc, request),
             Operation.AddDeleteAction => AddDeleteAction(doc, request),
@@ -880,7 +880,8 @@ public static class ObjectModifyEngine
     private static bool HasNamed(XElement collection, string key, string value) =>
         collection.Elements().Any(e => string.Equals(LocalValue(e, key), value, StringComparison.OrdinalIgnoreCase));
 
-    private static (object?, ToolResult<object>?) AddIndex(XDocument doc, ModifyRequest request)
+    private static (object?, ToolResult<object>?) AddIndex(
+        XDocument doc, ModifyRequest request, WriteTarget target, MetadataRepository? repo)
     {
         var root = doc.Root!;
         var ns = root.Name.Namespace;
@@ -895,12 +896,8 @@ public static class ObjectModifyEngine
 
         // Every named field must exist on the table, or the index is one the AOS will refuse
         // after a build cycle has already been paid for.
-        var declared = root.Elements().FirstOrDefault(e => e.Name.LocalName == "Fields");
-        var known = declared?.Elements()
-            .Select(e => LocalValue(e, "Name"))
-            .Where(n => !string.IsNullOrEmpty(n))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (known is not null && known.Count > 0)
+        var known = KnownIndexableFields(root, request, target, repo);
+        if (known is not null)
         {
             var missing = request.Fields!.Where(f => !known.Contains(f) && !SystemFieldNames.Contains(f)).ToList();
             if (missing.Count > 0)
@@ -914,8 +911,10 @@ public static class ObjectModifyEngine
         var index = new XElement(ns + "AxTableIndex",
             new XElement(ns + "Name", request.Member),
             request.AlternateKey ? new XElement(ns + "AlternateKey", "Yes") : null,
-            // The serializer's default is AllowDuplicates=Yes, so a unique index has to say so.
-            request.AllowDuplicates ? null : new XElement(ns + "AllowDuplicates", "No"),
+            // An absent AllowDuplicates means No (unique) — the standard application omits it on
+            // its unique indexes and spells out Yes on the others — so a non-unique index has to
+            // say Yes. Unique keeps the explicit No it always had.
+            new XElement(ns + "AllowDuplicates", request.AllowDuplicates ? "Yes" : "No"),
             new XElement(ns + "Fields",
                 request.Fields!.Select(f => new XElement(ns + "AxTableIndexField",
                     new XElement(ns + "DataField", f)))));
@@ -929,6 +928,57 @@ public static class ObjectModifyEngine
             alternateKey = request.AlternateKey,
         }, null);
     }
+
+    /// <summary>
+    /// The fields an index on <paramref name="request"/>'s table may name, or null when they
+    /// cannot be determined and the check has to be skipped.
+    /// </summary>
+    /// <remarks>
+    /// For a table this is its own <c>&lt;Fields&gt;</c>. For a table extension the document only
+    /// holds the fields that extension adds, so checking it alone refused every base-table
+    /// field (an index on <c>VendInvoiceInfoTable.Num</c> came back FIELD_NOT_FOUND) and skipped
+    /// the check entirely when the extension added none. An extension index may name the base
+    /// table's fields (from the index), its own, and those of the table's other extensions.
+    /// </remarks>
+    private static HashSet<string>? KnownIndexableFields(
+        XElement root, ModifyRequest request, WriteTarget target, MetadataRepository? repo)
+    {
+        var known = DeclaredFieldNames(root);
+        if (!target.IsExtension)
+            return known.Count > 0 ? known : null;
+
+        IReadOnlyList<TableFieldInfo>? baseFields = null;
+        try { baseFields = repo?.GetTableDetails(request.ObjectName)?.Fields; }
+        catch { /* no usable index — fall through to "cannot tell" */ }
+        if (baseFields is null || baseFields.Count == 0)
+            return null;
+
+        known.UnionWith(baseFields.Select(f => f.Name));
+
+        IReadOnlyList<ObjectExtensionInfo> siblings = Array.Empty<ObjectExtensionInfo>();
+        try { siblings = repo!.FindExtensions(request.ObjectName, null); }
+        catch { /* the base fields alone still make a useful check */ }
+        foreach (var ext in siblings)
+        {
+            if (string.Equals(ext.ExtensionName, target.Name, StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.IsNullOrEmpty(ext.SourcePath) || !File.Exists(ext.SourcePath)) continue;
+            try
+            {
+                var extRoot = XDocument.Load(ext.SourcePath).Root;
+                if (extRoot?.Name.LocalName == "AxTableExtension")
+                    known.UnionWith(DeclaredFieldNames(extRoot));
+            }
+            catch { /* an unreadable sibling only narrows the check */ }
+        }
+        return known;
+    }
+
+    private static HashSet<string> DeclaredFieldNames(XElement root) =>
+        (root.Elements().FirstOrDefault(e => e.Name.LocalName == "Fields")?.Elements()
+            ?? Enumerable.Empty<XElement>())
+        .Select(e => LocalValue(e, "Name"))
+        .Where(n => !string.IsNullOrEmpty(n))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase)!;
 
     /// <summary>Fields the kernel puts on every table; they are indexable but never declared.</summary>
     private static readonly IReadOnlySet<string> SystemFieldNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)

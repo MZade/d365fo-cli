@@ -48,7 +48,15 @@ public sealed class ObjectModifyEngineTests : IDisposable
             Publisher = "Microsoft",
             Layer = "app",
             IsCustom = false,
-            Tables = new[] { new ExtractedTable("CustTable", null, "x", Array.Empty<ExtractedTableField>()) },
+            Tables = new[]
+            {
+                new ExtractedTable("CustTable", null, "x", Array.Empty<ExtractedTableField>()),
+                new ExtractedTable("VendInvoiceInfoTable", null, "x", new[]
+                {
+                    new ExtractedTableField("Num", "String", "VendInvoiceId", null, false),
+                    new ExtractedTableField("InvoiceAccount", "String", "VendInvoiceAccount", null, true),
+                }),
+            },
             Enums = new[] { new ExtractedEnum("CustAccountStatus", null, Array.Empty<ExtractedEnumValue>()) },
             Edts = new[] { new ExtractedEdt("CustAccount", null, "String", null, 20) },
             Forms = new[] { new ExtractedForm("FmVehicleList", "x", Array.Empty<ExtractedFormDataSource>()) },
@@ -386,6 +394,129 @@ public sealed class ObjectModifyEngineTests : IDisposable
         Assert.False(result.Ok);
         Assert.Equal("FIELD_NOT_FOUND", result.Error!.Code);
         Assert.Null(capture.WriteVerb);
+    }
+
+    [Fact]
+    public void Add_index_with_duplicates_allowed_says_so_in_the_xml()
+    {
+        // An absent AllowDuplicates is read back as No, so writing nothing for a non-unique index
+        // produced a UNIQUE one while the response said unique:false.
+        var capture = new BridgeCapture(CustomTableXml);
+        using var harness = FakeBridge.Create(capture.Respond);
+
+        var result = ObjectModifyEngine.ModifyCore(new ObjectModifyEngine.ModifyRequest
+        {
+            Operation = ObjectModifyEngine.Operation.AddIndex,
+            Kind = "table",
+            ObjectName = "FmVehicle",
+            Member = "VinIdx",
+            Fields = new[] { "VIN" },
+            AllowDuplicates = true,
+        }, _repo, harness.Client, _journalDb);
+
+        Assert.True(result.Ok, result.Error?.Message);
+        var written = XDocument.Parse((string)capture.WriteArgs!["xml"]!);
+        var index = written.Descendants("AxTableIndex").Single(e => e.Element("Name")?.Value == "VinIdx");
+        Assert.Equal("Yes", index.Element("AllowDuplicates")?.Value);
+    }
+
+    private const string VendInvoiceInfoExtensionXml =
+        "<AxTableExtension xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\"><Name>VendInvoiceInfoTable.Extension</Name>" +
+        "<Fields><AxTableField i:type=\"AxTableFieldEnum\"><Name>FleetProcessed</Name></AxTableField></Fields>" +
+        "</AxTableExtension>";
+
+    /// <summary>Index table extensions the way an extract of their models would.</summary>
+    private void IndexTableExtensions(string model, params (string Name, string? SourcePath)[] extensions) =>
+        _repo.ApplyExtract(ExtractBatch.Empty(model) with
+        {
+            Publisher = model,
+            Layer = "isv",
+            IsCustom = false,
+            Extensions = extensions
+                .Select(e => new ExtractedObjectExtension("Table", "VendInvoiceInfoTable", e.Name, e.SourcePath))
+                .ToArray(),
+        });
+
+    [Fact]
+    public void Add_index_on_an_extension_accepts_the_base_tables_fields()
+    {
+        // The extension declares a field of its own, which used to make that the ONLY known
+        // field: Num and InvoiceAccount, both on the base table, came back FIELD_NOT_FOUND.
+        IndexTableExtensions("FleetExtensions", ("VendInvoiceInfoTable.Extension", null));
+        var capture = new BridgeCapture(VendInvoiceInfoExtensionXml);
+        using var harness = FakeBridge.Create(capture.Respond);
+
+        var result = ObjectModifyEngine.ModifyCore(new ObjectModifyEngine.ModifyRequest
+        {
+            Operation = ObjectModifyEngine.Operation.AddIndex,
+            Kind = "table",
+            ObjectName = "VendInvoiceInfoTable",
+            Member = "FleetNumInvoiceAccountIdx",
+            Fields = new[] { "Num", "InvoiceAccount", "FleetProcessed" },
+            AllowDuplicates = true,
+        }, _repo, harness.Client, _journalDb);
+
+        Assert.True(result.Ok, result.Error?.Message);
+        Assert.Equal("tableextension", (string?)capture.WriteArgs!["kind"]);
+        var written = XDocument.Parse((string)capture.WriteArgs!["xml"]!);
+        var index = written.Descendants("AxTableIndex").Single();
+        Assert.Equal("Yes", index.Element("AllowDuplicates")?.Value);
+        Assert.Equal(
+            new[] { "Num", "InvoiceAccount", "FleetProcessed" },
+            index.Element("Fields")!.Elements("AxTableIndexField").Select(f => f.Element("DataField")!.Value).ToArray());
+    }
+
+    [Fact]
+    public void Add_index_on_an_extension_without_fields_still_checks_them()
+    {
+        // With no <Fields> of its own the extension skipped the check, so any name went through.
+        var capture = new BridgeCapture(readXml: null);
+        using var harness = FakeBridge.Create(capture.Respond);
+
+        var result = ObjectModifyEngine.ModifyCore(new ObjectModifyEngine.ModifyRequest
+        {
+            Operation = ObjectModifyEngine.Operation.AddIndex,
+            Kind = "table",
+            ObjectName = "VendInvoiceInfoTable",
+            Member = "BadIdx",
+            Fields = new[] { "Num", "NoSuchField" },
+            AllowDuplicates = true,
+        }, _repo, harness.Client, _journalDb);
+
+        Assert.False(result.Ok);
+        Assert.Equal("FIELD_NOT_FOUND", result.Error!.Code);
+        Assert.Contains("'NoSuchField'", result.Error.Message);
+        Assert.DoesNotContain("'Num'", result.Error.Message);
+        Assert.Null(capture.WriteVerb);
+    }
+
+    [Fact]
+    public void Add_index_on_an_extension_accepts_a_field_another_extension_adds()
+    {
+        var siblingPath = Path.Combine(_journalRoot, "VendInvoiceInfoTable.OtherIsv.xml");
+        File.WriteAllText(siblingPath,
+            "<AxTableExtension xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\"><Name>VendInvoiceInfoTable.OtherIsv</Name>" +
+            "<Fields><AxTableField i:type=\"AxTableFieldString\"><Name>IsvReference</Name></AxTableField></Fields>" +
+            "</AxTableExtension>");
+        IndexTableExtensions("FleetExtensions",
+            ("VendInvoiceInfoTable.Extension", null),
+            ("VendInvoiceInfoTable.OtherIsv", siblingPath));
+
+        var capture = new BridgeCapture(VendInvoiceInfoExtensionXml);
+        using var harness = FakeBridge.Create(capture.Respond);
+
+        var result = ObjectModifyEngine.ModifyCore(new ObjectModifyEngine.ModifyRequest
+        {
+            Operation = ObjectModifyEngine.Operation.AddIndex,
+            Kind = "table",
+            ObjectName = "VendInvoiceInfoTable",
+            ExtensionSuffix = "Extension",
+            Member = "FleetIsvRefIdx",
+            Fields = new[] { "IsvReference", "Num" },
+            AllowDuplicates = true,
+        }, _repo, harness.Client, _journalDb);
+
+        Assert.True(result.Ok, result.Error?.Message);
     }
 
     [Fact]

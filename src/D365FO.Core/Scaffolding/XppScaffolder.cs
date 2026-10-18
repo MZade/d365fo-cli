@@ -132,7 +132,9 @@ public static class XppScaffolder
             indexEls.Add(new XElement("AxTableIndex",
                 new XElement("Name", idx.Name),
                 idx.AlternateKey ? new XElement("AlternateKey", "Yes") : null,
-                idx.Unique || idx.AlternateKey ? new XElement("AllowDuplicates", "No") : null,
+                // Absent means No (unique), so a non-unique index must spell out Yes. A
+                // valid-time-state key is always unique — it relied on that default before.
+                new XElement("AllowDuplicates", idx.Unique || idx.AlternateKey || idx.ValidTimeStateKey ? "No" : "Yes"),
                 // NoGap is the SDK default the serializer omits — only Gap is written.
                 idx.ValidTimeStateKey ? new XElement("ValidTimeStateKey", "Yes") : null,
                 idx.ValidTimeStateKey && string.Equals(idx.ValidTimeStateMode, "Gap", StringComparison.OrdinalIgnoreCase)
